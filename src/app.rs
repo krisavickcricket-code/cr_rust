@@ -1,4 +1,4 @@
-//! eframe / egui GUI for the CR extractor & model builder.
+//! eframe / egui GUI for the CR extractor, model builder, and SSWG mapping.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -10,8 +10,9 @@ use eframe::egui;
 
 use crate::model_builder::{self, Progress as ModelProgress};
 use crate::processor::{self, Progress};
+use crate::sswg_mapping::{self, Progress as SswgProgress};
 
-enum Mode { Idle, Extracting, Building }
+enum Mode { Idle, Extracting, Building, SswgMapping }
 
 pub struct CrApp {
     xml_path: String,
@@ -21,6 +22,7 @@ pub struct CrApp {
     mode: Mode,
     progress_rx: Option<Receiver<Progress>>,
     model_rx: Option<Receiver<ModelProgress>>,
+    sswg_rx: Option<Receiver<SswgProgress>>,
 }
 
 impl Default for CrApp {
@@ -33,6 +35,7 @@ impl Default for CrApp {
             mode: Mode::Idle,
             progress_rx: None,
             model_rx: None,
+            sswg_rx: None,
         }
     }
 }
@@ -66,25 +69,20 @@ impl CrApp {
         });
     }
 
-    #[allow(dead_code)]
-    fn drain_channel<T: std::fmt::Debug>(&mut self, rx: &mut Option<Receiver<T>>, on_log: impl Fn(&str), on_done: impl Fn(), label: &str) {
-        if let Some(r) = rx.take() {
-            loop {
-                match r.try_recv() {
-                    Ok(msg) => {
-                        let s = format!("{:?}", msg);
-                        if s.contains("Done") { on_done(); *rx = None; return; }
-                        else if s.contains("Error") { on_log(&s); on_done(); *rx = None; return; }
-                        else { on_log(&s); }
-                    }
-                    Err(TryRecvError::Empty) => { *rx = Some(r); return; }
-                    Err(TryRecvError::Disconnected) => {
-                        self.log(&format!("❌ {label} worker thread crashed."));
-                        on_done(); *rx = None; return;
-                    }
-                }
-            }
-        }
+    fn start_sswg(&mut self) {
+        let f = PathBuf::from(&self.model_folder);
+        if !f.is_dir() { self.log("ERROR: Input folder does not exist."); return; }
+        let (tx, rx) = mpsc::channel::<SswgProgress>();
+        self.sswg_rx = Some(rx);
+        self.mode = Mode::SswgMapping;
+        self.log("Started SSWG mapping…");
+        thread::spawn(move || {
+            let tx2 = tx.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                sswg_mapping::run(f, move |p| { let _ = tx2.send(p); });
+            }));
+            if result.is_err() { let _ = tx.send(SswgProgress::Error("SSWG mapping panicked".into())); }
+        });
     }
 
     fn poll(&mut self) {
@@ -114,6 +112,19 @@ impl CrApp {
                 }
             }
         }
+        // SSWG channel
+        if let Some(r) = self.sswg_rx.take() {
+            loop {
+                match r.try_recv() {
+                    Ok(SswgProgress::Log(s)) => self.log(&s),
+                    Ok(SswgProgress::Done) => { self.log("✅ SSWG mapping done."); self.mode = Mode::Idle; return; }
+                    Ok(SswgProgress::Error(e)) => { self.log(&format!("❌ {e}")); self.mode = Mode::Idle; return; }
+                    Err(TryRecvError::Empty) => { self.sswg_rx = Some(r); break; }
+                    Err(TryRecvError::Disconnected) => {
+                        self.log("❌ SSWG mapping worker thread crashed."); self.mode = Mode::Idle; return; }
+                }
+            }
+        }
     }
 
     fn log(&mut self, msg: &str) { self.log_lines.push(msg.to_string()); if self.log_lines.len() > 5000 { self.log_lines.drain(0..1000); } }
@@ -127,7 +138,7 @@ impl eframe::App for CrApp {
         if self.is_busy() { ctx.request_repaint_after(Duration::from_secs(1)); }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("CR — CIM XML Extractor & Model Builder");
+            ui.heading("CR — CIM XML Extractor, Model Builder & SSWG Mapping");
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -170,6 +181,17 @@ impl eframe::App for CrApp {
                 if matches!(self.mode, Mode::Building) { ui.spinner(); ui.label("Building model…"); }
                 else if !self.is_busy() {
                     if ui.button("▶  Build Model").clicked() { self.start_model(); }
+                }
+            });
+
+            ui.separator();
+            ui.heading("SSWG Mapping");
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                if matches!(self.mode, Mode::SswgMapping) { ui.spinner(); ui.label("Mapping…"); }
+                else if !self.is_busy() {
+                    if ui.button("▶  SSWG Mapping").clicked() { self.start_sswg(); }
                 }
             });
 

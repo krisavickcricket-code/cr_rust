@@ -3,6 +3,8 @@
 mod app;
 mod model_builder;
 mod processor;
+mod sswg_mapping;
+mod table;
 
 use eframe::egui;
 
