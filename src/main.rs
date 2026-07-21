@@ -1,6 +1,7 @@
 //! Entry point for the CR XML-to-CSV extractor GUI.
 
 mod app;
+mod industrial_load;
 mod model_builder;
 mod processor;
 mod sswg_mapping;

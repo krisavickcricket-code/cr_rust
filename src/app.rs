@@ -1,4 +1,4 @@
-//! eframe / egui GUI for the CR extractor, model builder, and SSWG mapping.
+//! eframe / egui GUI for the CR extractor, model builder, SSWG mapping, and industrial load processor.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -8,21 +8,24 @@ use std::time::Duration;
 
 use eframe::egui;
 
+use crate::industrial_load::{self, Progress as IndustrialProgress};
 use crate::model_builder::{self, Progress as ModelProgress};
 use crate::processor::{self, Progress};
 use crate::sswg_mapping::{self, Progress as SswgProgress};
 
-enum Mode { Idle, Extracting, Building, SswgMapping }
+enum Mode { Idle, Extracting, Building, SswgMapping, IndustrialLoad }
 
 pub struct CrApp {
     xml_path: String,
     out_folder: String,
     model_folder: String,
+    planning_raw: String,
     log_lines: Vec<String>,
     mode: Mode,
     progress_rx: Option<Receiver<Progress>>,
     model_rx: Option<Receiver<ModelProgress>>,
     sswg_rx: Option<Receiver<SswgProgress>>,
+    industrial_rx: Option<Receiver<IndustrialProgress>>,
 }
 
 impl Default for CrApp {
@@ -31,11 +34,13 @@ impl Default for CrApp {
             xml_path: r"B:\ERCOT\CIM Data\CIM_Redacted.xml".into(),
             out_folder: r"B:\ERCOT\CIM Data\May2026 ML1 Files".into(),
             model_folder: r"B:\ERCOT\CIM Data\May2026 ML1 Files".into(),
+            planning_raw: r"B:\ERCOT\CIM Data\May2026 ML1 Files\Output\23SSWG_2024_FAL2_U2_Final_06102024.raw".into(),
             log_lines: Vec::new(),
             mode: Mode::Idle,
             progress_rx: None,
             model_rx: None,
             sswg_rx: None,
+            industrial_rx: None,
         }
     }
 }
@@ -85,8 +90,25 @@ impl CrApp {
         });
     }
 
+    fn start_industrial(&mut self) {
+        let folder = PathBuf::from(&self.model_folder).join("Output");
+        let planning = PathBuf::from(&self.planning_raw);
+        if !folder.is_dir() { self.log("ERROR: Output folder does not exist."); return; }
+        if !planning.exists() { self.log("ERROR: Planning .raw file does not exist."); return; }
+        let (tx, rx) = mpsc::channel::<IndustrialProgress>();
+        self.industrial_rx = Some(rx);
+        self.mode = Mode::IndustrialLoad;
+        self.log("Started industrial load processing…");
+        thread::spawn(move || {
+            let tx2 = tx.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                industrial_load::run(folder, planning, move |p| { let _ = tx2.send(p); });
+            }));
+            if result.is_err() { let _ = tx.send(IndustrialProgress::Error("Industrial load processor panicked".into())); }
+        });
+    }
+
     fn poll(&mut self) {
-        // Extract channel
         if let Some(r) = self.progress_rx.take() {
             loop {
                 match r.try_recv() {
@@ -99,7 +121,6 @@ impl CrApp {
                 }
             }
         }
-        // Model channel
         if let Some(r) = self.model_rx.take() {
             loop {
                 match r.try_recv() {
@@ -112,7 +133,6 @@ impl CrApp {
                 }
             }
         }
-        // SSWG channel
         if let Some(r) = self.sswg_rx.take() {
             loop {
                 match r.try_recv() {
@@ -122,6 +142,18 @@ impl CrApp {
                     Err(TryRecvError::Empty) => { self.sswg_rx = Some(r); break; }
                     Err(TryRecvError::Disconnected) => {
                         self.log("❌ SSWG mapping worker thread crashed."); self.mode = Mode::Idle; return; }
+                }
+            }
+        }
+        if let Some(r) = self.industrial_rx.take() {
+            loop {
+                match r.try_recv() {
+                    Ok(IndustrialProgress::Log(s)) => self.log(&s),
+                    Ok(IndustrialProgress::Done) => { self.log("✅ Industrial load processing done."); self.mode = Mode::Idle; return; }
+                    Ok(IndustrialProgress::Error(e)) => { self.log(&format!("❌ {e}")); self.mode = Mode::Idle; return; }
+                    Err(TryRecvError::Empty) => { self.industrial_rx = Some(r); break; }
+                    Err(TryRecvError::Disconnected) => {
+                        self.log("❌ Industrial load worker thread crashed."); self.mode = Mode::Idle; return; }
                 }
             }
         }
@@ -138,7 +170,7 @@ impl eframe::App for CrApp {
         if self.is_busy() { ctx.request_repaint_after(Duration::from_secs(1)); }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("CR — CIM XML Extractor, Model Builder & SSWG Mapping");
+            ui.heading("CR — CIM XML Extractor, Model Builder, SSWG Mapping & Industrial Load");
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -192,6 +224,25 @@ impl eframe::App for CrApp {
                 if matches!(self.mode, Mode::SswgMapping) { ui.spinner(); ui.label("Mapping…"); }
                 else if !self.is_busy() {
                     if ui.button("▶  SSWG Mapping").clicked() { self.start_sswg(); }
+                }
+            });
+
+            ui.separator();
+            ui.heading("Industrial Load");
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label("Planning .raw:");
+                ui.add(egui::TextEdit::singleline(&mut self.planning_raw).desired_width(460.0).hint_text("SSWG planning model .raw file"));
+                if ui.button("Browse…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("raw", &["raw"]).pick_file() { self.planning_raw = p.display().to_string(); }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                if matches!(self.mode, Mode::IndustrialLoad) { ui.spinner(); ui.label("Processing…"); }
+                else if !self.is_busy() {
+                    if ui.button("▶  Industrial Load").clicked() { self.start_industrial(); }
                 }
             });
 
