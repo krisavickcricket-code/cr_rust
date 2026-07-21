@@ -905,6 +905,13 @@ pub fn run(input_folder: PathBuf, progress: impl FnMut(Progress) + Send + 'stati
         ercothubmap.s(r, 1, rndata.g(i, 3));
         ercothubmap.s(r, 2, "1".to_string());
     }
+    // DC tie entries
+    for i in 0..dc.n() {
+        let r = ercothubmap.add_row();
+        ercothubmap.s(r, 0, dc.gr(i, dc.c("etx-DCTie-etx:DCTie.DCTieLZName")));
+        ercothubmap.s(r, 1, dc.gr(i, dc_cn));
+        ercothubmap.s(r, 2, "1".to_string());
+    }
 
     // ── ERCOT LZ Map ──
     let mut ercotlzmap = Table::new();
@@ -1009,6 +1016,8 @@ pub fn run(input_folder: PathBuf, progress: impl FnMut(Progress) + Send + 'stati
                     }
                 }
             }
+            let fail_col = newuplan.c("Fail");
+            newuplan.rows.retain(|row| row.get(fail_col).map(|v| v.as_ref()).unwrap_or("") != "1");
             newuplan.write_csv(&out.join("UPLAN Contingency New.csv")).ok();
 
             // ── Disconnector-level contingency ──
