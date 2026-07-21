@@ -957,7 +957,7 @@ pub fn run(input_folder: PathBuf, progress: impl FnMut(Progress) + Send + 'stati
             let mut newuplan = Table::new();
             newuplan.add_col("Contingency Name"); newuplan.add_col("Line"); newuplan.add_col("LineID"); newuplan.add_col("Fail");
             let cid = ctab.c("Contingency-Contingency ID");
-            let etype = ctab.c("Contingency-Element type");
+            let etype = ctab.c("Contingency-Element Type");
             let teid = ctab.c("Contingency-Element TEID");
             let mut finalcontig = String::new();
             for i in 0..ctab.n() {
@@ -966,7 +966,7 @@ pub fn run(input_folder: PathBuf, progress: impl FnMut(Progress) + Send + 'stati
                     finalcontig = conting;
                 } else {
                     let et = ctab.g(i, etype);
-                    if et == "ACLineSegment" || et == "Breaker" {
+                    if et == "ACLineSegment" || et == "Breaker" || et == "SynchronousMachine" {
                         let r = newuplan.add_row();
                         newuplan.s(r, newuplan.c("Contingency Name"), finalcontig.clone());
                         newuplan.s(r, newuplan.c("LineID"), ctab.g(i, teid));
@@ -999,7 +999,66 @@ pub fn run(input_folder: PathBuf, progress: impl FnMut(Progress) + Send + 'stati
                     }
                 }
             }
+            // Join to Generator Data (on LineID = Generator Data-TEID)
+            let gd_idx = gendata.index(gendata.c("TEID"));
+            for i in 0..newuplan.n() {
+                let key = newuplan.g(i, newuplan.c("LineID"));
+                if let Some(rs) = gd_idx.get(key.as_str()) {
+                    for &r in rs {
+                        newuplan.s(i, newuplan.c("Line"), gendata.gr(r, gendata.c("Generator Name")));
+                    }
+                }
+            }
             newuplan.write_csv(&out.join("UPLAN Contingency New.csv")).ok();
+
+            // ── Disconnector-level contingency ──
+            // Same contingency data, joined against pre-elimination tables
+            log("Disconnector-level contingency processing…".to_string());
+            let mut disc_uplan = newuplan.clone_t();
+            // Clear Line and Fail columns (they were joined against post-elimination data)
+            let disc_line_col = disc_uplan.c("Line");
+            let disc_fail_col = disc_uplan.c("Fail");
+            for i in 0..disc_uplan.n() {
+                disc_uplan.s(i, disc_line_col, "");
+                disc_uplan.s(i, disc_fail_col, "");
+            }
+            // Join to Line Data Disconnector Level (linedatacopy)
+            let ldc_idx = linedatacopy.index(linedatacopy.c("ID Number"));
+            for i in 0..disc_uplan.n() {
+                let key = disc_uplan.g(i, disc_uplan.c("LineID"));
+                if let Some(rs) = ldc_idx.get(key.as_str()) {
+                    for &r in rs {
+                        disc_uplan.s(i, disc_line_col, linedatacopy.gr(r, linedatacopy.c("Line Name")));
+                        if linedatacopy.gr(r, linedatacopy.c("From Bus")) == linedatacopy.gr(r, linedatacopy.c("To Bus")) {
+                            disc_uplan.s(i, disc_fail_col, "1".to_string());
+                        }
+                    }
+                }
+            }
+            // Join to Transformer Data Disconnector Level (xmrdatacopy)
+            let xdc_idx = xmrdatacopy.index(xmrdatacopy.c("ID Number"));
+            for i in 0..disc_uplan.n() {
+                let key = disc_uplan.g(i, disc_uplan.c("LineID"));
+                if let Some(rs) = xdc_idx.get(key.as_str()) {
+                    for &r in rs {
+                        disc_uplan.s(i, disc_line_col, xmrdatacopy.gr(r, xmrdatacopy.c("Line Name")));
+                        if xmrdatacopy.gr(r, xmrdatacopy.c("From Bus")) == xmrdatacopy.gr(r, xmrdatacopy.c("To Bus")) {
+                            disc_uplan.s(i, disc_fail_col, "1".to_string());
+                        }
+                    }
+                }
+            }
+            // Join to Generator Data Disconnector Level (gendatacopy)
+            let gdc_idx = gendatacopy.index(gendatacopy.c("TEID"));
+            for i in 0..disc_uplan.n() {
+                let key = disc_uplan.g(i, disc_uplan.c("LineID"));
+                if let Some(rs) = gdc_idx.get(key.as_str()) {
+                    for &r in rs {
+                        disc_uplan.s(i, disc_line_col, gendatacopy.gr(r, gendatacopy.c("Generator Name")));
+                    }
+                }
+            }
+            disc_uplan.write_csv(&out.join("Contingency Disconnector Level.csv")).ok();
         }
     }
 
